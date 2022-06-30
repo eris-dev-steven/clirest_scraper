@@ -1,5 +1,6 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from enum import Enum, unique
+from typing import List, Optional, Tuple
 from math import ceil
 from json import dumps
 import aiohttp
@@ -23,6 +24,69 @@ def max_min_query_params(oid_field: str) -> dict:
     }
 
 
+@unique
+class RestGeometryType(Enum):
+    Point = "esriGeometryPoint"
+    Multipoint = "esriGeometryMultipoint"
+    Polyline = "esriGeometryPolyline"
+    Polygon = "esriGeometryPolygon"
+    Envelope = "esriGeometryEnvelope"
+    _None = "esriGeometryNone"
+
+
+@unique
+class RestFieldType(Enum):
+    Blob = "esriFieldTypeBlob"
+    Date = "esriFieldTypeDate"
+    Double = "esriFieldTypeDouble"
+    Float = "esriFieldTypeFloat"
+    Geometry = "esriFieldTypeGeometry"
+    GlobalID = "esriFieldTypeGlobalID"
+    GUID = "esriFieldTypeGUID"
+    Integer = "esriFieldTypeInteger"
+    OID = "esriFieldTypeOID"
+    Raster = "esriFieldTypeRaster"
+    Single = "esriFieldTypeSingle"
+    SmallInteger = "esriFieldTypeSmallInteger"
+    String = "esriFieldTypeString"
+    XML = "esriFieldTypeXML"
+
+
+class RestField:
+    
+    def __init__(self, field: dict) -> None:
+        self.name = field["name"]
+        self.type = RestFieldType(field["type"])
+        self.alias = field["alias"]
+        if "domain" in field and field["domain"] and field["domain"]["type"] == "codedValue":
+            domain = field["domain"]
+            self.is_code = True
+            self.codes = {
+                str(codedValue["code"]): codedValue["name"]
+                for codedValue in domain["codedValues"]
+            }
+        else:
+            self.is_code = False
+            self.codes = {}
+    
+    @staticmethod
+    def for_geometry(name: str):
+        return RestField(field={
+            "name": name,
+            "alias": name,
+            "type": RestFieldType.Geometry.value,
+        })
+
+    def json_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "type": self.type.value,
+            "alias": self.alias,
+            "is_code": self.is_code,
+        }
+
+
+
 @dataclass
 class RestMetadata:
     url: str
@@ -32,9 +96,9 @@ class RestMetadata:
     pagination: bool
     stats: bool
     server_type: str
-    geo_type: str
-    fields: List[str]
-    oid_field: str
+    geo_type: RestGeometryType
+    fields: List[RestField]
+    oid_field: Optional[RestField]
     max_min_oid: Tuple[int, int]
     inc_oid: bool
     spatial_reference: int
@@ -94,7 +158,7 @@ class RestMetadata:
         max_record_count = -1
         pagination = False
         stats = False
-        geo_type = ""
+        geo_type = RestGeometryType._None
         fields = []
         oid_field = ""
         max_min_oid = (-1, -1)
@@ -124,17 +188,22 @@ class RestMetadata:
                         stats = advanced_query.get("supportsStatistics", False)
                     else:
                         stats = json.get("supportsStatistics", False)
-                    geo_type = json.get("geometryType", "")
+                    geo_type = RestGeometryType(json.get("geometryType", ""))
                     fields = [
-                        field["name"] for field in json["fields"]
+                        RestField(field) for field in json["fields"]
                         if field["name"] != "Shape" and field["type"] != "esriFieldTypeGeometry"
                     ]
-                    if geo_type == "esriGeometryPoint":
-                        fields += ["X", "Y"]
-                    elif geo_type == "esriGeometryMultipoint":
-                        fields += ["POINTS"]
-                    elif geo_type == "esriGeometryPolygon":
-                        fields += ["RINGS"]
+                    match geo_type:
+                        case RestGeometryType.Point:
+                            fields += [RestField.for_geometry("X"), RestField.for_geometry("Y")]
+                        case RestGeometryType.Multipoint:
+                            fields += [RestField.for_geometry("POINTS")]
+                        case RestGeometryType.Polygon:
+                            fields += [RestField.for_geometry("RINGS")]
+                        case RestGeometryType.Polyline:
+                            fields += [RestField.for_geometry("PATHS")]
+                        case RestGeometryType.Point:
+                            fields += [RestField.for_geometry("ENVELOPE")]
                     oid_fields = [
                         field["name"] for field in json["fields"]
                         if field["type"] == "esriFieldTypeOID"
@@ -207,7 +276,7 @@ class RestMetadata:
         Returns the request params for the feature's geometry. Empty dict if the server is a table
         """
         return {} if self.is_table else {
-            "geometryType": self.geo_type,
+            "geometryType": self.geo_type.value,
             "outSR": self.spatial_reference,
         }
 
@@ -227,9 +296,9 @@ class RestMetadata:
                 "Pagination": self.pagination,
                 "Stats": self.stats,
                 "Server Type": self.server_type,
-                "Geometry Type": self.geo_type,
+                "Geometry Type": self.geo_type.value,
                 "Spatial Reference": self.spatial_reference,
-                "Fields": self.fields,
+                "Fields": [field.json_dict() for field in self.fields],
                 "OID Fields": self.oid_field,
             } | oid_stats,
             indent=4

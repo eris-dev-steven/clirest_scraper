@@ -8,23 +8,34 @@ from scraping import fetch_query
 from csv import reader, writer, QUOTE_MINIMAL
 from argparse import ArgumentParser, Namespace
 from tqdm import tqdm
+from functools import reduce
+from operator import iconcat
 
 
-async def fetch_worker(queue: asyncio.Queue, done_queue: asyncio.Queue, ssl: bool):
-    while True:
-        query, params, geo_type, max_tries = await queue.get()
-        result = await fetch_query(query, params, geo_type, max_tries, ssl)
-        await done_queue.put(result)
-        queue.task_done()
+async def fetch_worker(t: tqdm, queue: asyncio.Queue, done_queue: asyncio.Queue, ssl: bool):
+    try:
+        while True:
+            query, params, fields, geo_type, max_tries = await queue.get()
+            result = await fetch_query(t, query, params, fields, geo_type, max_tries, ssl)
+            await done_queue.put(result)
+            queue.task_done()
+    except Exception as ex:
+        t.write(f"Encountered an error in the fetch worker {ex.with_traceback()}")
 
 
-async def csv_writer_worker(queue: asyncio.Queue, metadata: RestMetadata):
-    with open(f"{metadata.name}.csv", encoding="utf8", mode="w", newline="") as output_file:
+async def csv_writer_worker(t: tqdm, queue: asyncio.Queue, metadata: RestMetadata):
+    try:
+        output_file = open(f"output_files\{metadata.name}.csv", encoding="utf8", mode="w", newline="")
         csv_writer = writer(output_file, delimiter=",", quotechar='"', quoting=QUOTE_MINIMAL)
-        csv_writer.writerow(metadata.fields)
+        header_cols = list(reduce(
+            iconcat,
+            [
+                [field.name, f"{field.name}_DESC"] if field.is_code else [field.name]
+                for field in metadata.fields
+            ],
+        ))
+        csv_writer.writerow(header_cols)
         results_handled = 0
-        total_results = len(metadata.queries)
-        t = tqdm(total=total_results)
         while True:
             result = await queue.get()
             if isinstance(result, BaseException):
@@ -42,6 +53,10 @@ async def csv_writer_worker(queue: asyncio.Queue, metadata: RestMetadata):
             results_handled += 1
             queue.task_done()
             t.update(1)
+    except Exception as ex:
+        t.write(f"Encountered an error in the writer worker {ex.with_traceback()}")
+    finally:
+        output_file.close()
 
 
 async def main(args: Namespace):
@@ -51,14 +66,16 @@ async def main(args: Namespace):
     if proceed == "N":
         proceed = input("Proceed with scrape? (y/n)").upper()
     if proceed == "Y":
+        total_results = len(metadata.queries)
+        t = tqdm(total=total_results)
         fetch_worker_queue = asyncio.Queue(args.workers)
         writer_queue = asyncio.Queue(args.workers)
         start = time.time()
-        workers = [asyncio.create_task(fetch_worker(fetch_worker_queue, writer_queue, args.ssl))]
-        writer_task = asyncio.create_task(csv_writer_worker(writer_queue, metadata))
+        workers = [asyncio.create_task(fetch_worker(t, fetch_worker_queue, writer_queue, args.ssl))]
+        writer_task = asyncio.create_task(csv_writer_worker(t, writer_queue, metadata))
 
         for (query, params) in metadata.queries:
-            await fetch_worker_queue.put((query, params, metadata.geo_type, args.tries))
+            await fetch_worker_queue.put((query, params, metadata.fields, metadata.geo_type, args.tries))
 
         await fetch_worker_queue.join()
 
@@ -68,7 +85,8 @@ async def main(args: Namespace):
         await writer_queue.join()
         writer_task.cancel()
 
-        print(f"Scraping done. Took {time.time() - start} seconds")
+        t.write(f"Scraping done. Took {round(time.time() - start, 2)} seconds")
+        t.close()
     print("Exiting Program")
 
 if __name__ == "__main__":
