@@ -2,11 +2,14 @@ import os
 from asyncio import sleep
 from tempfile import NamedTemporaryFile
 from numpy import format_float_positional
-from typing import Any, List
+from typing import Any, List, Optional
 from json import dumps
-from aiohttp import ClientSession, ClientConnectorError, ClientError
-from metadata import RestMetadata
+from aiohttp import ClientSession, ClientConnectorError, ClientError, ClientSSLError
 from csv import writer, QUOTE_MINIMAL
+from metadata import RestField, RestFieldType, RestGeometryType
+from functools import reduce
+from operator import iconcat
+from tqdm import tqdm
 
 
 def convert_json_value(x: Any) -> str:
@@ -41,7 +44,14 @@ def convert_json_value(x: Any) -> str:
         return str(x)
 
 
-def handle_record(geo_type: str, feature: dict) -> List[str]:
+def convert_json_field(x: Any, field: Optional[RestField] = None) -> List[str]:
+    if field.is_code:
+        code = convert_json_value(x)
+        return [code.strip(), field.codes.get(code,'').strip()]
+    return [convert_json_value(x)]
+
+
+def handle_record(fields: List[RestField], geo_type: str, feature: dict) -> List[str]:
     """
     Parameters
     ----------
@@ -53,36 +63,95 @@ def handle_record(geo_type: str, feature: dict) -> List[str]:
     ------
     feature object converted to List[str] with geometry is applicable
     """
+    attributes = feature["attributes"]
     # collect all values from the attributes key and convert them to string
     record = [
-        convert_json_value(value).strip()
-        for value in feature["attributes"].values()
+        convert_json_field(attributes[field.name], field=field)
+        for field in fields
+        if field.type != RestFieldType.Geometry
     ]
     # If geometry is point, get X and Y and add to the record. If no geometry present, default to a
     # blank X and Y
-    if geo_type == "esriGeometryPoint":
-        record += [
-            convert_json_value(point).strip()
-            for point in feature.get("geometry", {"x": "", "y": ""}).values()
-        ]
-    # If geometry is multi point, join coordinates into a list of points using json list notation
-    # and add to the record
-    elif geo_type == "esriGeometryMultipoint":
-        record += [convert_json_value(feature["geometry"]["points"]).strip()]
-    # If geometry is Polygon get the rings and add the value to the record
-    elif geo_type == "esriGeometryPolygon":
-        record += [convert_json_value(feature["geometry"]["rings"]).strip()]
-    # Other geometries could exist but are not currently handled
-    return record
+    match geo_type:
+        case RestGeometryType.Point:
+            record += [
+                [convert_json_value(point).strip()]
+                for point in feature.get("geometry", {"x": "", "y": ""}).values()
+            ]
+        # If geometry is multipoint, join coordinates into a list of points using json list notation
+        # and add to the record
+        case RestGeometryType.Multipoint:
+            record += [[convert_json_value(feature["geometry"]["points"]).strip()]]
+        # If geometry is Polyline get the paths and add the value to the record
+        case RestGeometryType.Polyline:
+            record += [[convert_json_value(feature["geometry"]["paths"]).strip()]]
+        # If geometry is Polygon get the rings and add the value to the record
+        case RestGeometryType.Polygon:
+            record += [[convert_json_value(feature["geometry"]["rings"]).strip()]]
+        # If geometry is Envolpe get the each bound and add the dict to the record
+        case RestGeometryType.Envelope:
+            geometry = feature["geometry"]
+            bounds_map = {}
+            if "xmin" in geometry:
+                bounds_map["xmin"] = geometry["xmin"]
+            if "ymin" in geometry:
+                bounds_map["ymin"] = geometry["ymin"]
+            if "xmax" in geometry:
+                bounds_map["xmax"] = geometry["xmax"]
+            if "ymax" in geometry:
+                bounds_map["ymax"] = geometry["ymax"]
+            if "zmin" in geometry:
+                bounds_map["zmin"] = geometry["zmin"]
+            if "zmax" in geometry:
+                bounds_map["zmax"] = geometry["zmax"]
+            if "mmin" in geometry:
+                bounds_map["mmin"] = geometry["mmin"]
+            if "mmax" in geometry:
+                bounds_map["mmax"] = geometry["mmax"]
+            record += [[convert_json_value(bounds_map).strip()]]
+    return list(reduce(
+        iconcat,
+        record,
+    ))
 
 
-async def fetch_query(query: str,
-                      rest_metadata: RestMetadata,
-                      max_tries: int) -> NamedTemporaryFile:
+async def check_json_response(response: dict) -> bool:
+    """
+    Parameters
+    ----------
+    response : dict
+        json response from an HTTP request
+    Return
+    ------
+    A boolean value indicating if the response is valid. Raises an error if the issue with the
+    response cannot be recovered from
+    """
+    if "features" not in response.keys():
+        # No features in response and JSON has an error code, retry query
+        if "error" in response.keys():
+            print("Request had an error... sleeping for 5sec to try again")
+            # Sleep to give the server sometime to handle the request again
+            await sleep(5)
+            return False
+        # No features in response and no error code. Raise error which
+        # terminates all operations
+        else:
+            raise KeyError("Response was not an error but no features found")
+    return True
+
+
+async def fetch_query(t: tqdm,
+                      query: str,
+                      params: dict,
+                      fields: List[RestField],
+                      geo_type: RestGeometryType,
+                      max_tries: int,
+                      ssl: bool,) -> NamedTemporaryFile:
     temp_file = NamedTemporaryFile(
         mode="w",
         encoding="utf8",
         suffix=".csv",
+        dir="temp_files",
         delete=False,
         newline="\n"
     )
@@ -91,44 +160,44 @@ async def fetch_query(query: str,
         try:
             invalid_response = True
             json_response = dict()
-            try_number = 1
+            try_number = 0
             while invalid_response:
-                async with session.get(query) as response:
+                async with session.get(query, params=params, ssl=ssl) as response:
+                    try_number += 1
                     try:
                         invalid_response = response.status != 200
                         if invalid_response:
-                            print(f"Error: {query} got this response:\n{await response.text()}")
-                        json_response = await response.json()
-                        # Check to make sure JSON response has features
-                        if "features" not in json_response.keys():
-                            # No features in response and JSON has an error code, retry query
-                            if "error" in json_response.keys():
-                                print("Request had an error... trying again")
-                                invalid_response = True
-                                # Sleep to give the server sometime to handle the request again
-                                await sleep(10)
-                                try_number += 1
-                            # No features in response and no error code. Raise error which
-                            # terminates all operations
-                            else:
-                                raise KeyError("Response was not an error but no features found")
+                            response_text = await response.text()
+                            t.write(f"Error: {query} got this response:\n{response_text}")
+                        else:
+                            json_response = await response.json(content_type=response.content_type)
+                            # Check to make sure JSON response has features
+                            invalid_response = not await check_json_response(json_response)
                     except ClientConnectorError:
-                        await sleep(10)
+                        t.write("Client connection error... sleeping for 5sec")
+                        await sleep(5)
                         invalid_response = True
-                        try_number += 1
                 if try_number > max_tries:
                     raise Exception(f"Too many tries to fetch query ({query})")
-
             # write all rows to temp csv file using a mapping generator
             with open(temp_file.name, "w", newline="", encoding="utf8") as csv_file:
                 csv_writer = writer(csv_file, delimiter=",", quotechar='"', quoting=QUOTE_MINIMAL)
                 csv_writer.writerows(
                     (
-                        handle_record(rest_metadata.geo_type, feature)
+                        handle_record(fields, geo_type, feature)
                         for feature in json_response["features"]
                     )
                 )
-        except ClientError as ex:
+        except ClientSSLError as ex:
+            t.write("Client error raised. Issue with the service's SSL certification")
+            t.write("To avoid this error you can provide '--ssl false' as a command line argument")
+            t.write("THIS IS VERY RISKY!! Only use this argument if you are sure the site is legit")
+            t.write(ex)
             os.remove(temp_file.name)
             raise ex
-        return temp_file
+        except ClientError as ex:
+            t.write(ex)
+            os.remove(temp_file.name)
+            raise ex
+    t.write(f"Done with query for params = {params}")
+    return temp_file

@@ -1,21 +1,90 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from enum import Enum, unique
+from typing import List, Optional, Tuple
 from math import ceil
 from json import dumps
 import aiohttp
 
 
-def max_min_query(oid_field: str) -> str:
-    """
-    Helper query postfix to get max and min Oid values. Given an Oid field name, can be added to the
-    end of a base url
-    """
-    return f'/query?outStatistics=%5B%0D%0A+%7B%0D%0A++++"statisticType"%3A+"max"%2C%0D%0A' \
-           f'++++"onStatisticField' \
-           f'"%3A+"{oid_field}"%2C+++++%0D%0A++++"outStatisticFieldName"%3A+"MAX_VALUE"%0D%0A' \
-           f'++%7D%2C%0D%0A++%7B%0D%0A++++"statisticType"%3A+"min"%2C%0D%0A++++"onStatisticField' \
-           f'"%3A+"{oid_field}"%2C+++++%0D%0A++++"outStatisticFieldName"%3A+"MIN_VALUE"%0D%0A' \
-           f'++%7D%0D%0A%5D&f=json'
+def max_min_query_params(oid_field: str) -> dict:
+    """ Returns the query params for calculating the max and min OID values """
+    max_stat = {
+        "statisticType": "max",
+        "onStatisticField": oid_field,
+        "outStatisticFieldName": "MAX_VALUE",
+    }
+    min_stat = {
+        "statisticType": "min",
+        "onStatisticField": oid_field,
+        "outStatisticFieldName": "MIN_VALUE"
+    }
+    return {
+        "outStatistics": dumps([max_stat, min_stat]),
+        "f": "json",
+    }
+
+
+@unique
+class RestGeometryType(Enum):
+    Point = "esriGeometryPoint"
+    Multipoint = "esriGeometryMultipoint"
+    Polyline = "esriGeometryPolyline"
+    Polygon = "esriGeometryPolygon"
+    Envelope = "esriGeometryEnvelope"
+    _None = "esriGeometryNone"
+
+
+@unique
+class RestFieldType(Enum):
+    Blob = "esriFieldTypeBlob"
+    Date = "esriFieldTypeDate"
+    Double = "esriFieldTypeDouble"
+    Float = "esriFieldTypeFloat"
+    Geometry = "esriFieldTypeGeometry"
+    GlobalID = "esriFieldTypeGlobalID"
+    GUID = "esriFieldTypeGUID"
+    Integer = "esriFieldTypeInteger"
+    OID = "esriFieldTypeOID"
+    Raster = "esriFieldTypeRaster"
+    Single = "esriFieldTypeSingle"
+    SmallInteger = "esriFieldTypeSmallInteger"
+    String = "esriFieldTypeString"
+    XML = "esriFieldTypeXML"
+
+
+class RestField:
+    
+    def __init__(self, field: dict) -> None:
+        self.name = field["name"]
+        self.type = RestFieldType(field["type"])
+        self.alias = field["alias"]
+        if "domain" in field and field["domain"] and field["domain"]["type"] == "codedValue":
+            domain = field["domain"]
+            self.is_code = True
+            self.codes = {
+                str(codedValue["code"]): codedValue["name"]
+                for codedValue in domain["codedValues"]
+            }
+        else:
+            self.is_code = False
+            self.codes = {}
+    
+    @staticmethod
+    def for_geometry(name: str):
+        return RestField(field={
+            "name": name,
+            "alias": name,
+            "type": RestFieldType.Geometry.value,
+        })
+
+    def json_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "type": self.type.value,
+            "alias": self.alias,
+            "is_code": self.is_code,
+        }
+
 
 
 @dataclass
@@ -27,11 +96,12 @@ class RestMetadata:
     pagination: bool
     stats: bool
     server_type: str
-    geo_type: str
-    fields: List[str]
-    oid_field: str
+    geo_type: RestGeometryType
+    fields: List[RestField]
+    oid_field: Optional[RestField]
     max_min_oid: Tuple[int, int]
     inc_oid: bool
+    spatial_reference: int
     """
     Data class for the backing information for an ArcGIS REST server and how to query the service
 
@@ -68,30 +138,44 @@ class RestMetadata:
     """
 
     @staticmethod
-    async def from_url(url: str):
-        count_query = "/query?where=1%3D1&returnCountOnly=true&f=json"
-        field_query = "?f=json"
+    async def from_url(url: str, ssl: bool, spatial_reference: int):
+        count_query_params = {
+            "where": "1=1",
+            "returnCountOnly": "true",
+            "f": "json",
+        }
+        field_query_params = {
+            "f": "json"
+        }
+        ids_only_params = {
+            "where": "1=1",
+            "returnIdsOnly": "true",
+            "f": "json",
+        }
         source_count = -1
         server_type = ""
         name = ""
         max_record_count = -1
         pagination = False
         stats = False
-        geo_type = ""
+        geo_type = RestGeometryType._None
         fields = []
         oid_field = ""
         max_min_oid = (-1, -1)
         inc_oid = False
+        query_url = f"{url}/query"
 
         async with aiohttp.ClientSession() as session:
-            async with session.get(url + count_query) as response:
+            async with session.get(query_url,
+                                   params=count_query_params,
+                                   ssl=ssl) as response:
                 if response.status == 200:
-                    json = await response.json()
+                    json = await response.json(content_type=response.content_type)
                     source_count = json.get("count", -1)
 
-            async with session.get(url + field_query) as response:
+            async with session.get(url, params=field_query_params, ssl=ssl) as response:
                 if response.status == 200:
-                    json = await response.json()
+                    json = await response.json(content_type=response.content_type)
                     advanced_query = json.get("advancedQueryCapabilities", dict())
                     server_type = json["type"]
                     name = json["name"]
@@ -104,39 +188,48 @@ class RestMetadata:
                         stats = advanced_query.get("supportsStatistics", False)
                     else:
                         stats = json.get("supportsStatistics", False)
-                    geo_type = json.get("geometryType", "")
+                    geo_type = RestGeometryType(json.get("geometryType", ""))
                     fields = [
-                        field["name"] for field in json["fields"]
+                        RestField(field) for field in json["fields"]
                         if field["name"] != "Shape" and field["type"] != "esriFieldTypeGeometry"
                     ]
-                    if geo_type == "esriGeometryPoint":
-                        fields += ["X", "Y"]
-                    elif geo_type == "esriGeometryMultipoint":
-                        fields += ["POINTS"]
-                    elif geo_type == "esriGeometryPolygon":
-                        fields += ["RINGS"]
+                    match geo_type:
+                        case RestGeometryType.Point:
+                            fields += [RestField.for_geometry("X"), RestField.for_geometry("Y")]
+                        case RestGeometryType.Multipoint:
+                            fields += [RestField.for_geometry("POINTS")]
+                        case RestGeometryType.Polygon:
+                            fields += [RestField.for_geometry("RINGS")]
+                        case RestGeometryType.Polyline:
+                            fields += [RestField.for_geometry("PATHS")]
+                        case RestGeometryType.Point:
+                            fields += [RestField.for_geometry("ENVELOPE")]
                     oid_fields = [
                         field["name"] for field in json["fields"]
                         if field["type"] == "esriFieldTypeOID"
                     ]
                     if oid_fields:
                         oid_field = oid_fields[0]
-        if stats and oid_field and not pagination:
-            async with session.get(url + max_min_query(oid_field)) as response:
-                if response.status == 200:
-                    json = await response.json()
-                    attributes = json["features"][0]["attributes"]
-                    max_min_oid = (attributes["MAX_VALUE"], attributes["MIN_VALUE"])
-                    diff = max_min_oid[0] - max_min_oid[1] + 1
-                    inc_oid = diff == source_count
-        elif oid_field:
-            async with session.get(url + max_min_query(oid_field)) as response:
-                if response.status == 200:
-                    json = await response.json()
-                    oid_values = json["objectIds"]
-                    max_min_oid = (max(oid_values), min(oid_values))
-                    diff = max_min_oid[0] - max_min_oid[1] + 1
-                    inc_oid = diff == source_count
+            if not pagination and stats and oid_field:
+                async with session.get(query_url,
+                                       params=max_min_query_params(oid_field),
+                                       ssl=ssl) as response:
+                    if response.status == 200:
+                        json = await response.json(content_type=response.content_type)
+                        attributes = json["features"][0]["attributes"]
+                        max_min_oid = (attributes["MAX_VALUE"], attributes["MIN_VALUE"])
+                        diff = max_min_oid[0] - max_min_oid[1] + 1
+                        inc_oid = diff == source_count
+            elif not pagination and not stats and oid_field:
+                async with session.get(query_url,
+                                       params=ids_only_params,
+                                       ssl=ssl) as response:
+                    if response.status == 200:
+                        json = await response.json(content_type=response.content_type)
+                        oid_values = json["objectIds"]
+                        max_min_oid = (max(oid_values), min(oid_values))
+                        diff = max_min_oid[0] - max_min_oid[1] + 1
+                        inc_oid = diff == source_count
         return RestMetadata(
             url,
             name,
@@ -149,8 +242,13 @@ class RestMetadata:
             fields,
             oid_field,
             max_min_oid,
-            inc_oid
+            inc_oid,
+            spatial_reference
         )
+
+    @property
+    def query_url(self) -> str:
+        return f"{self.url}/query"
 
     @property
     def scrape_count(self) -> int:
@@ -173,20 +271,22 @@ class RestMetadata:
         return self.server_type == "TABLE"
 
     @property
-    def geo_text(self) -> str:
+    def geo_params(self) -> dict:
         """
-        String added to the queries for geometry. If service is a Table then empty string.
-        Adds an out spatial reference for geometry to NAD83. Might need to be changed in the future
-
-        TO-DO
-        ----
-        - add ability to provide spatial reference override for non-NA services
+        Returns the request params for the feature's geometry. Empty dict if the server is a table
         """
-        return "" if self.is_table else f"&geometryType={self.geo_type}&outSR=4269"
+        return {} if self.is_table else {
+            "geometryType": self.geo_type.value,
+            "outSR": self.spatial_reference,
+        }
 
     @property
     def json_text(self) -> str:
         """ Converts class attributes to a dict for displaying details as JSON text """
+        oid_stats = {} if self.pagination else {
+            "Max Min OID": self.max_min_oid,
+            "Incremental OID": self.inc_oid
+        }
         return dumps(
             {
                 "URL": self.url,
@@ -196,17 +296,16 @@ class RestMetadata:
                 "Pagination": self.pagination,
                 "Stats": self.stats,
                 "Server Type": self.server_type,
-                "Geometry Type": self.geo_type,
-                "Fields": self.fields,
+                "Geometry Type": self.geo_type.value,
+                "Spatial Reference": self.spatial_reference,
+                "Fields": [field.json_dict() for field in self.fields],
                 "OID Fields": self.oid_field,
-                "Max Min OID": self.max_min_oid,
-                "Incremental OID": self.inc_oid
-            },
+            } | oid_stats,
             indent=4
         )
 
     @property
-    def queries(self) -> List[str]:
+    def queries(self) -> List[Tuple[str, dict]]:
         """
         Get all the queries for this service. Returns empty list when no query method available
 
@@ -216,30 +315,38 @@ class RestMetadata:
         """
         if self.pagination:
             return [
-                self.url + self.get_pagination_query(i)
+                (self.query_url, self.get_pagination_query_params(i))
                 for i in range(self.pagination_query_count)
             ]
         elif self.oid_field:
             return [
-                self.url + self.get_oid_query(
-                    self.max_min_oid[1] + (i * self.scrape_count)
-                )
+                (self.query_url, self.get_oid_query_params(i))
                 for i in range(self.oid_query_count)
             ]
         else:
             return []
 
-    def get_pagination_query(self, query_num: int) -> str:
+    def get_pagination_query_params(self, query_num: int) -> dict:
         """
-        Generate query for service when pagination is supported using query_num to get offset
+        Generate query params for service when pagination is supported using query_num to get offset
         """
-        return f"/query?where=1+%3D+1&resultOffset={query_num * self.scrape_count}" \
-               f"&resultRecordCount={self.scrape_count}{self.geo_text}&outFields=*&f=json"
+        return {
+            "where": "1=1",
+            "resultOffset": query_num * self.scrape_count,
+            "resultRecordCount": self.scrape_count,
+            "outFields": "*",
+            "f": "json",
+        } | self.geo_params
 
-    def get_oid_query(self, min_oid: int) -> str:
+    def get_oid_query_params(self, index: int) -> dict:
         """
-        Generate query for service when Oid is used using a starting Oid number and an offset
+        Generate query params for service when Oid is available using a starting Oid number and an
+        offset
         """
-        return f"/query?where={self.oid_field}+>%3D+{min_oid}+and+" \
-               f"{self.oid_field}+<%3D+{min_oid + self.scrape_count - 1}" \
-               f"{self.geo_text}&outFields=*&f=json"
+        min_oid = self.max_min_oid[1] + (index * self.scrape_count)
+        max_oid = min_oid + self.scrape_count - 1
+        return {
+            "where": f"{self.oid_field} > {min_oid} and {self.oid_field} < {max_oid}",
+            "outFields": "*",
+            "f": "json",
+        } | self.geo_params

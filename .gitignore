@@ -1,1 +1,5 @@
 /test_files
+/temp_files
+/__pycache__
+/output_files
+/.vscode
