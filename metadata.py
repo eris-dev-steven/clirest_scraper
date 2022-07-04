@@ -1,9 +1,11 @@
+from textwrap import dedent
 from dataclasses import dataclass
 from enum import Enum, unique
 from typing import List, Optional, Tuple
 from math import ceil
 from json import dumps
-import aiohttp
+from aiohttp import ClientSession
+from pandas import DataFrame
 
 
 def max_min_query_params(oid_field: str) -> dict:
@@ -31,7 +33,7 @@ class RestGeometryType(Enum):
     Polyline = "esriGeometryPolyline"
     Polygon = "esriGeometryPolygon"
     Envelope = "esriGeometryEnvelope"
-    _None = "esriGeometryNone"
+    None_ = "esriGeometryNone"
 
 
 @unique
@@ -53,7 +55,6 @@ class RestFieldType(Enum):
 
 
 class RestField:
-    
     def __init__(self, field: dict) -> None:
         self.name = field["name"]
         self.type = RestFieldType(field["type"])
@@ -68,7 +69,6 @@ class RestField:
         else:
             self.is_code = False
             self.codes = {}
-    
     @staticmethod
     def for_geometry(name: str):
         return RestField(field={
@@ -77,14 +77,14 @@ class RestField:
             "type": RestFieldType.Geometry.value,
         })
 
-    def json_dict(self) -> dict:
+    @property
+    def as_dict(self) -> dict:
         return {
             "name": self.name,
             "type": self.type.value,
             "alias": self.alias,
             "is_code": self.is_code,
         }
-
 
 
 @dataclass
@@ -101,7 +101,8 @@ class RestMetadata:
     oid_field: Optional[RestField]
     max_min_oid: Tuple[int, int]
     inc_oid: bool
-    spatial_reference: int
+    source_spatial_reference: Optional[int]
+    output_spatial_reference: Optional[int]
     """
     Data class for the backing information for an ArcGIS REST server and how to query the service
 
@@ -138,7 +139,7 @@ class RestMetadata:
     """
 
     @staticmethod
-    async def from_url(url: str, ssl: bool, spatial_reference: int):
+    async def from_url(url: str, ssl: bool, output_spatial_reference: Optional[int] = None):
         count_query_params = {
             "where": "1=1",
             "returnCountOnly": "true",
@@ -158,14 +159,15 @@ class RestMetadata:
         max_record_count = -1
         pagination = False
         stats = False
-        geo_type = RestGeometryType._None
+        geo_type = RestGeometryType.None_
         fields = []
         oid_field = ""
         max_min_oid = (-1, -1)
         inc_oid = False
         query_url = f"{url}/query"
+        source_spatial_reference = None
 
-        async with aiohttp.ClientSession() as session:
+        async with ClientSession() as session:
             async with session.get(query_url,
                                    params=count_query_params,
                                    ssl=ssl) as response:
@@ -180,6 +182,10 @@ class RestMetadata:
                     server_type = json["type"]
                     name = json["name"]
                     max_record_count = int(json["maxRecordCount"])
+                    spatial_reference_obj = json.get("sourceSpatialReference", dict())
+                    source_spatial_reference = spatial_reference_obj.get("wkid", None)
+                    if source_spatial_reference is not None:
+                        source_spatial_reference = int(source_spatial_reference)
                     if advanced_query:
                         pagination = advanced_query.get("supportsPagination", False)
                     else:
@@ -205,8 +211,8 @@ class RestMetadata:
                         case RestGeometryType.Point:
                             fields += [RestField.for_geometry("ENVELOPE")]
                     oid_fields = [
-                        field["name"] for field in json["fields"]
-                        if field["type"] == "esriFieldTypeOID"
+                        field for field in fields
+                        if field.type == RestFieldType.OID
                     ]
                     if oid_fields:
                         oid_field = oid_fields[0]
@@ -243,7 +249,8 @@ class RestMetadata:
             oid_field,
             max_min_oid,
             inc_oid,
-            spatial_reference
+            source_spatial_reference,
+            output_spatial_reference,
         )
 
     @property
@@ -275,34 +282,41 @@ class RestMetadata:
         """
         Returns the request params for the feature's geometry. Empty dict if the server is a table
         """
-        return {} if self.is_table else {
-            "geometryType": self.geo_type.value,
-            "outSR": self.spatial_reference,
-        }
+        if self.is_table:
+            return {}
+        if self.output_spatial_reference is not None:
+            return {
+                "geometryType": self.geo_type.value,
+                "outSR": self.output_spatial_reference,
+            }
+        elif self.source_spatial_reference is not None:
+            return {
+                "geometryType": self.geo_type.value,
+                "outSR": self.source_spatial_reference,
+            }
+        else:
+            raise AttributeError("No spatial reference provided to service with geometry")
 
-    @property
-    def json_text(self) -> str:
+    def print_formatted(self):
         """ Converts class attributes to a dict for displaying details as JSON text """
-        oid_stats = {} if self.pagination else {
-            "Max Min OID": self.max_min_oid,
-            "Incremental OID": self.inc_oid
-        }
-        return dumps(
-            {
-                "URL": self.url,
-                "Name": self.name,
-                "Source Count": self.source_count,
-                "Max Record Count": self.max_record_count,
-                "Pagination": self.pagination,
-                "Stats": self.stats,
-                "Server Type": self.server_type,
-                "Geometry Type": self.geo_type.value,
-                "Spatial Reference": self.spatial_reference,
-                "Fields": [field.json_dict() for field in self.fields],
-                "OID Fields": self.oid_field,
-            } | oid_stats,
-            indent=4
-        )
+        print("Metadata")
+        print("--------")
+        temp_str = f"""\
+            URL: {self.url}
+            Name: {self.name}
+            Feature Count: {self.source_count}
+            Max Scrape Chunk Count: {self.max_record_count}
+            Server Type: {self.server_type}"""
+        print(dedent(temp_str))
+        if not self.is_table:
+            print(f"Geometry Type: {self.geo_type.value}")
+        print("Fields:")
+        df_fields = DataFrame(data=(field.as_dict for field in self.fields))
+        print(df_fields.to_string(index=False))
+        if self.oid_field is not None:
+            print(f"OID Field: {self.oid_field.name}")
+        if self.source_spatial_reference is not None:
+            print(f"Source Spatial Reference: {self.source_spatial_reference}")
 
     @property
     def queries(self) -> List[Tuple[str, dict]]:
@@ -331,12 +345,12 @@ class RestMetadata:
         Generate query params for service when pagination is supported using query_num to get offset
         """
         return {
-            "where": "1=1",
-            "resultOffset": query_num * self.scrape_count,
-            "resultRecordCount": self.scrape_count,
-            "outFields": "*",
-            "f": "json",
-        } | self.geo_params
+                   "where": "1=1",
+                   "resultOffset": query_num * self.scrape_count,
+                   "resultRecordCount": self.scrape_count,
+                   "outFields": "*",
+                   "f": "json",
+               } | self.geo_params
 
     def get_oid_query_params(self, index: int) -> dict:
         """
@@ -346,7 +360,7 @@ class RestMetadata:
         min_oid = self.max_min_oid[1] + (index * self.scrape_count)
         max_oid = min_oid + self.scrape_count - 1
         return {
-            "where": f"{self.oid_field} > {min_oid} and {self.oid_field} < {max_oid}",
-            "outFields": "*",
-            "f": "json",
-        } | self.geo_params
+                   "where": f"{self.oid_field} > {min_oid} and {self.oid_field} < {max_oid}",
+                   "outFields": "*",
+                   "f": "json",
+               } | self.geo_params
