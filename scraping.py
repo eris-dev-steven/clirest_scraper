@@ -190,13 +190,10 @@ async def fetch_query(t: tqdm,
                     raise Exception(f"Too many tries to fetch query ({query})")
             # write all rows to temp csv file using a mapping generator
             with open(temp_file.name, "w", newline="", encoding="utf8") as csv_file:
-                csv_writer = writer(csv_file, delimiter=",", quotechar='"', quoting=QUOTE_MINIMAL)
-                csv_writer.writerows(
-                    (
-                        handle_record(fields, geo_type, feature)
-                        for feature in json_response["features"]
-                    )
-                )
+                for feature in json_response["features"]:
+                    record = handle_record(fields, geo_type, feature)
+                    line = ",".join([handle_csv_value(value) for value in record]) + "\n"
+                    csv_file.write(line)
         except ClientSSLError as ex:
             t.write("Client error raised. Issue with the service's SSL certification")
             t.write("To avoid this error you can provide '--ssl false' as a command line argument")
@@ -208,5 +205,4 @@ async def fetch_query(t: tqdm,
             t.write(ex)
             os_remove(temp_file.name)
             raise ex
-    t.write(f"Done with query for params = {params}")
     return temp_file
