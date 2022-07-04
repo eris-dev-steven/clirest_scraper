@@ -1,4 +1,4 @@
-import os
+from os import remove as os_remove
 from asyncio import sleep
 from tempfile import NamedTemporaryFile
 from numpy import format_float_positional
@@ -47,15 +47,17 @@ def convert_json_value(x: Any) -> str:
 def convert_json_field(x: Any, field: Optional[RestField] = None) -> List[str]:
     if field.is_code:
         code = convert_json_value(x)
-        return [code.strip(), field.codes.get(code,'').strip()]
+        return [code.strip(), field.codes.get(code, '').strip()]
     return [convert_json_value(x)]
 
 
-def handle_record(fields: List[RestField], geo_type: str, feature: dict) -> List[str]:
+def handle_record(fields: List[RestField], geo_type: RestGeometryType, feature: dict) -> List[str]:
     """
     Parameters
     ----------
-    geo_type : str
+    fields : List[RestField]
+        service fields to collect feature attributes
+    geo_type : RestGeometryType
         geometry type from the RestMetadata object
     feature : str
         json object from the query's feature json array
@@ -88,7 +90,7 @@ def handle_record(fields: List[RestField], geo_type: str, feature: dict) -> List
         # If geometry is Polygon get the rings and add the value to the record
         case RestGeometryType.Polygon:
             record += [[convert_json_value(feature["geometry"]["rings"]).strip()]]
-        # If geometry is Envolpe get the each bound and add the dict to the record
+        # If geometry is Envelope get each bound and add the dict to the record
         case RestGeometryType.Envelope:
             geometry = feature["geometry"]
             bounds_map = {}
@@ -138,6 +140,13 @@ async def check_json_response(response: dict) -> bool:
         else:
             raise KeyError("Response was not an error but no features found")
     return True
+
+
+def handle_csv_value(value: str) -> str:
+    if any((char == ',' or char == '"' or char == '\r' or char == '\n' for char in value)):
+        new_value = value.replace("\"", "\"\"")
+        return f'"{new_value}"'
+    return value
 
 
 async def fetch_query(t: tqdm,
@@ -193,11 +202,11 @@ async def fetch_query(t: tqdm,
             t.write("To avoid this error you can provide '--ssl false' as a command line argument")
             t.write("THIS IS VERY RISKY!! Only use this argument if you are sure the site is legit")
             t.write(ex)
-            os.remove(temp_file.name)
+            os_remove(temp_file.name)
             raise ex
         except ClientError as ex:
             t.write(ex)
-            os.remove(temp_file.name)
+            os_remove(temp_file.name)
             raise ex
     t.write(f"Done with query for params = {params}")
     return temp_file
